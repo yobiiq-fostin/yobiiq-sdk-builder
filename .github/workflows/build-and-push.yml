@@ -4,9 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       tag_version:
-        description: 'Version tag (e.g., v3.2.1)'
+        description: 'NCS version to build (e.g., v3.5.0-preview4), empty for VERSION.txt'
         required: false
-        default: 'v3.2.1'
+        default: ''
+      rebuild:
+        description: 'Replace an exact version tag that is already published'
+        type: boolean
+        required: false
+        default: false
   push:
     branches:
       - main
@@ -39,8 +44,21 @@ jobs:
       
       - name: Read version from VERSION.txt
         id: version
+        env:
+          TAG_VERSION: ${{ inputs.tag_version }}
         run: |
-          NCS_VERSION=$(grep NRF_CONNECT_SDK_VERSION VERSION.txt | cut -d'=' -f2)
+          FILE_VERSION=$(grep NRF_CONNECT_SDK_VERSION VERSION.txt | cut -d'=' -f2)
+          NCS_VERSION="${TAG_VERSION:-$FILE_VERSION}"
+          if ! [[ "${NCS_VERSION}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Invalid NCS version: ${NCS_VERSION}"
+            exit 1
+          fi
+          # Only a released version from VERSION.txt moves the tags shared between builds
+          if [[ "${NCS_VERSION}" == "${FILE_VERSION}" && "${NCS_VERSION}" != *-* ]]; then
+            echo "moving_tags=true" >> $GITHUB_OUTPUT
+          else
+            echo "moving_tags=false" >> $GITHUB_OUTPUT
+          fi
           echo "ncs_version=${NCS_VERSION}" >> $GITHUB_OUTPUT
           echo "image_tag=${NCS_VERSION}" >> $GITHUB_OUTPUT
           # Extract major.minor version (e.g., v3.2 from v3.2.1)
@@ -57,69 +75,79 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       
+      - name: Check whether the version is already published
+        id: published
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ steps.repo.outputs.image_name }}:${{ steps.version.outputs.image_tag }}
+          REBUILD: ${{ inputs.rebuild }}
+        run: |
+          # An exact version tag is what the SDK workflows pin: never replace it by accident
+          if [[ "${REBUILD}" == "true" ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          elif output=$(docker manifest inspect "${IMAGE}" 2>&1); then
+            echo "${IMAGE} is already published, nothing to do. Run the workflow by hand with rebuild to replace it." >> $GITHUB_STEP_SUMMARY
+            echo "skip=true" >> $GITHUB_OUTPUT
+          elif [[ "${output}" == *"manifest unknown"* ]]; then
+            echo "skip=false" >> $GITHUB_OUTPUT
+          else
+            echo "Cannot tell whether ${IMAGE} is published: ${output}"
+            exit 1
+          fi
+
       - name: Extract metadata for Docker
+        if: steps.published.outputs.skip != 'true'
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ${{ env.REGISTRY }}/${{ steps.repo.outputs.image_name }}
           tags: |
             type=raw,value=${{ steps.version.outputs.image_tag }}
-            type=raw,value=${{ steps.version.outputs.major_minor }}
-            type=raw,value=latest
-            type=sha,prefix=sha-
+            type=raw,value=${{ steps.version.outputs.major_minor }},enable=${{ steps.version.outputs.moving_tags }}
+            type=raw,value=latest,enable=${{ steps.version.outputs.moving_tags }}
+            type=sha,prefix=sha-,enable=${{ steps.version.outputs.moving_tags }}
       
-      - name: Build and push Docker image
+      - name: Build Docker image
+        if: steps.published.outputs.skip != 'true'
         uses: docker/build-push-action@v5
         timeout-minutes: 120
         with:
           context: .
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          load: true
+          tags: ${{ steps.repo.outputs.image_name }}:verify
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64
           build-args: |
+            NCS_VERSION=${{ steps.version.outputs.ncs_version }}
             BUILDKIT_INLINE_CACHE=1
             PIP_NO_CACHE_DIR=1
-      
+
       - name: Run image verification
+        if: steps.published.outputs.skip != 'true'
+        run: ./scripts/verify-image.sh "${{ steps.repo.outputs.image_name }}:verify" "${{ steps.version.outputs.ncs_version }}"
+
+      - name: Push Docker image
+        if: steps.published.outputs.skip != 'true'
+        env:
+          VERIFIED_IMAGE: ${{ steps.repo.outputs.image_name }}:verify
+          TAGS: ${{ steps.meta.outputs.tags }}
         run: |
-          echo "Pulling image for verification..."
-          docker pull ${{ env.REGISTRY }}/${{ steps.repo.outputs.image_name }}:${{ steps.version.outputs.image_tag }}
-          
-          echo "Running verification tests..."
-          docker run --rm ${{ env.REGISTRY }}/${{ steps.repo.outputs.image_name }}:${{ steps.version.outputs.image_tag }} /bin/bash -c "
-            source /opt/ncs_env.sh
-            set -e
-            echo '=== Checking nrfutil ==='
-            nrfutil --version
-            echo '=== Checking West ==='
-            west --version
-            echo '=== Checking CMake ==='
-            cmake --version
-            echo '=== Checking Ninja ==='
-            ninja --version
-            echo '=== Checking Python ==='
-            python3 --version
-            echo '=== Checking GCC ==='
-            arm-zephyr-eabi-gcc --version | head -n1
-            echo '=== Checking Environment ==='
-            echo \"NCS_INSTALL_DIR: \$NCS_INSTALL_DIR\"
-            echo \"ZEPHYR_SDK_INSTALL_DIR: \$ZEPHYR_SDK_INSTALL_DIR\"
-            echo '=== All checks passed! ==='
-          "
-      
+          # Push the image that passed verification, never a second build of it
+          for tag in ${TAGS}; do
+            docker tag "${VERIFIED_IMAGE}" "${tag}"
+            docker push "${tag}"
+          done
+
       - name: Create summary
+        if: steps.published.outputs.skip != 'true'
         run: |
           echo "## Docker Image Built Successfully :rocket:" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Image:** \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Tags:**" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.version.outputs.image_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`${{ steps.version.outputs.major_minor }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- \`latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "${{ steps.meta.outputs.tags }}" | sed 's/.*:/- /' >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**nRF Connect SDK Version:** ${{ steps.version.outputs.ncs_version }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
